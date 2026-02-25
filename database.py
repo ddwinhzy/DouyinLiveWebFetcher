@@ -3,9 +3,31 @@
 """
 import sqlite3
 import hashlib
+import threading
+import time
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
+
+
+# 重试装饰器
+def retry_on_lock(max_retries: int = 3, delay: float = 0.1):
+    """数据库锁错误重试装饰器"""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except sqlite3.OperationalError as e:
+                    last_exception = e
+                    if "locked" in str(e).lower() and attempt < max_retries - 1:
+                        time.sleep(delay * (attempt + 1))  # 指数退避
+                    else:
+                        raise
+            raise last_exception
+        return wrapper
+    return decorator
 
 
 class Database:
@@ -17,8 +39,15 @@ class Database:
         :param db_path: 数据库文件路径
         """
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        # 启用超时设置 (5秒)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False, timeout=5.0)
         self.conn.row_factory = sqlite3.Row
+        # 设置WAL模式
+        self.conn.execute('PRAGMA journal_mode=WAL')
+        # 设置 busy_timeout
+        self.conn.execute('PRAGMA busy_timeout=5000')
+        # 线程锁
+        self._lock = threading.Lock()
         self._create_tables()
 
     def _create_tables(self):
@@ -165,6 +194,7 @@ class Database:
         )
         return cursor.fetchone() is not None
 
+    @retry_on_lock(max_retries=3, delay=0.1)
     def _insert_message_record(
         self,
         room_id: int,
@@ -174,7 +204,7 @@ class Database:
         user_name: str
     ) -> Optional[int]:
         """
-        插入消息记录到总表
+        插入消息记录到总表 (使用INSERT OR IGNORE避免TOCTOU漏洞)
         :param room_id: 直播间ID
         :param msg_type: 消息类型
         :param msg_unique_key: 消息唯一键
@@ -182,19 +212,21 @@ class Database:
         :param user_name: 用户名
         :return: 插入的记录ID
         """
-        if self._message_exists(msg_unique_key):
-            return None
-
+        # 使用 INSERT OR IGNORE 替代先检查后插入，避免TOCTOU漏洞
         cursor = self.conn.execute(
-            '''INSERT INTO messages (room_id, msg_type, msg_unique_key, user_id, user_name)
+            '''INSERT OR IGNORE INTO messages (room_id, msg_type, msg_unique_key, user_id, user_name)
                VALUES (?, ?, ?, ?, ?)''',
             (room_id, msg_type, msg_unique_key, user_id or '', user_name or '')
         )
         self.conn.commit()
+        # 如果没有插入新行，说明记录已存在
+        if cursor.rowcount == 0:
+            return None
         return cursor.lastrowid
 
     # ==================== 直播间操作 ====================
 
+    @retry_on_lock(max_retries=3, delay=0.1)
     def insert_live_room(
         self,
         room_id: str,
@@ -212,14 +244,15 @@ class Database:
         :param anchor_id: 主播ID
         :return: 直播间记录ID
         """
-        cursor = self.conn.execute(
-            '''INSERT OR REPLACE INTO live_rooms
-               (room_id, live_id, title, anchor_name, anchor_id, create_time)
-               VALUES (?, ?, ?, ?, ?, ?)''',
-            (room_id, live_id, title, anchor_name, anchor_id, datetime.now().isoformat())
-        )
-        self.conn.commit()
-        return cursor.lastrowid
+        with self._lock:
+            cursor = self.conn.execute(
+                '''INSERT OR REPLACE INTO live_rooms
+                   (room_id, live_id, title, anchor_name, anchor_id, create_time)
+                   VALUES (?, ?, ?, ?, ?, ?)''',
+                (room_id, live_id, title, anchor_name, anchor_id, datetime.now().isoformat())
+            )
+            self.conn.commit()
+            return cursor.lastrowid
 
     def get_live_room_by_room_id(self, room_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -249,6 +282,7 @@ class Database:
 
     # ==================== 聊天消息操作 ====================
 
+    @retry_on_lock(max_retries=3, delay=0.1)
     def insert_chat_message(
         self,
         room_id: int,
@@ -266,30 +300,29 @@ class Database:
         :param msg_unique_key: 消息唯一键
         :return: 插入的记录ID，如果重复则返回None
         """
-        if not msg_unique_key:
-            msg_unique_key = self._generate_message_unique_key(
-                room_id, 'chat', user_id, content or ''
+        with self._lock:
+            if not msg_unique_key:
+                msg_unique_key = self._generate_message_unique_key(
+                    room_id, 'chat', user_id, content or ''
+                )
+
+            # 插入总表 (使用INSERT OR IGNORE避免TOCTOU漏洞)
+            self._insert_message_record(
+                room_id, 'chat', msg_unique_key, user_id, user_name
             )
 
-        # 先检查总表
-        if self._message_exists(msg_unique_key):
-            return None
-
-        # 插入总表
-        self._insert_message_record(
-            room_id, 'chat', msg_unique_key, user_id, user_name
-        )
-
-        # 插入详细表
-        cursor = self.conn.execute(
-            '''INSERT OR IGNORE INTO chat_messages
-               (room_id, user_id, user_name, content, msg_unique_key, create_time)
-               VALUES (?, ?, ?, ?, ?, ?)''',
-            (room_id, user_id or '', user_name or '', content or '',
-             msg_unique_key, datetime.now().isoformat())
-        )
-        self.conn.commit()
-        return cursor.lastrowid if cursor.lastrowid else None
+            # 插入详细表
+            cursor = self.conn.execute(
+                '''INSERT OR IGNORE INTO chat_messages
+                   (room_id, user_id, user_name, content, msg_unique_key, create_time)
+                   VALUES (?, ?, ?, ?, ?, ?)''',
+                (room_id, user_id or '', user_name or '', content or '',
+                 msg_unique_key, datetime.now().isoformat())
+            )
+            self.conn.commit()
+            if cursor.rowcount == 0:
+                return None
+            return cursor.lastrowid
 
     def get_chat_messages_by_room(
         self,
@@ -310,6 +343,7 @@ class Database:
 
     # ==================== 礼物消息操作 ====================
 
+    @retry_on_lock(max_retries=3, delay=0.1)
     def insert_gift_message(
         self,
         room_id: int,
@@ -331,29 +365,29 @@ class Database:
         :param msg_unique_key: 消息唯一键
         :return: 插入的记录ID，如果重复则返回None
         """
-        content = f"{gift_id}:{gift_count}"
-        if not msg_unique_key:
-            msg_unique_key = self._generate_message_unique_key(
-                room_id, 'gift', user_id, content
+        with self._lock:
+            content = f"{gift_id}:{gift_count}"
+            if not msg_unique_key:
+                msg_unique_key = self._generate_message_unique_key(
+                    room_id, 'gift', user_id, content
+                )
+
+            self._insert_message_record(
+                room_id, 'gift', msg_unique_key, user_id, user_name
             )
 
-        if self._message_exists(msg_unique_key):
-            return None
-
-        self._insert_message_record(
-            room_id, 'gift', msg_unique_key, user_id, user_name
-        )
-
-        cursor = self.conn.execute(
-            '''INSERT OR IGNORE INTO gift_messages
-               (room_id, user_id, user_name, gift_id, gift_name, gift_count,
-                msg_unique_key, create_time)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-            (room_id, user_id or '', user_name or '', gift_id, gift_name or '',
-             gift_count, msg_unique_key, datetime.now().isoformat())
-        )
-        self.conn.commit()
-        return cursor.lastrowid if cursor.lastrowid else None
+            cursor = self.conn.execute(
+                '''INSERT OR IGNORE INTO gift_messages
+                   (room_id, user_id, user_name, gift_id, gift_name, gift_count,
+                    msg_unique_key, create_time)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                (room_id, user_id or '', user_name or '', gift_id, gift_name or '',
+                 gift_count, msg_unique_key, datetime.now().isoformat())
+            )
+            self.conn.commit()
+            if cursor.rowcount == 0:
+                return None
+            return cursor.lastrowid
 
     def get_gift_messages_by_room(
         self,
@@ -374,6 +408,7 @@ class Database:
 
     # ==================== 点赞消息操作 ====================
 
+    @retry_on_lock(max_retries=3, delay=0.1)
     def insert_like_message(
         self,
         room_id: int,
@@ -391,28 +426,28 @@ class Database:
         :param msg_unique_key: 消息唯一键
         :return: 插入的记录ID，如果重复则返回None
         """
-        content = str(like_count)
-        if not msg_unique_key:
-            msg_unique_key = self._generate_message_unique_key(
-                room_id, 'like', user_id, content
+        with self._lock:
+            content = str(like_count)
+            if not msg_unique_key:
+                msg_unique_key = self._generate_message_unique_key(
+                    room_id, 'like', user_id, content
+                )
+
+            self._insert_message_record(
+                room_id, 'like', msg_unique_key, user_id, user_name
             )
 
-        if self._message_exists(msg_unique_key):
-            return None
-
-        self._insert_message_record(
-            room_id, 'like', msg_unique_key, user_id, user_name
-        )
-
-        cursor = self.conn.execute(
-            '''INSERT OR IGNORE INTO like_messages
-               (room_id, user_id, user_name, like_count, msg_unique_key, create_time)
-               VALUES (?, ?, ?, ?, ?, ?)''',
-            (room_id, user_id or '', user_name or '', like_count,
-             msg_unique_key, datetime.now().isoformat())
-        )
-        self.conn.commit()
-        return cursor.lastrowid if cursor.lastrowid else None
+            cursor = self.conn.execute(
+                '''INSERT OR IGNORE INTO like_messages
+                   (room_id, user_id, user_name, like_count, msg_unique_key, create_time)
+                   VALUES (?, ?, ?, ?, ?, ?)''',
+                (room_id, user_id or '', user_name or '', like_count,
+                 msg_unique_key, datetime.now().isoformat())
+            )
+            self.conn.commit()
+            if cursor.rowcount == 0:
+                return None
+            return cursor.lastrowid
 
     def get_like_messages_by_room(
         self,
@@ -433,6 +468,7 @@ class Database:
 
     # ==================== 进房消息操作 ====================
 
+    @retry_on_lock(max_retries=3, delay=0.1)
     def insert_member_message(
         self,
         room_id: int,
@@ -450,27 +486,27 @@ class Database:
         :param msg_unique_key: 消息唯一键
         :return: 插入的记录ID，如果重复则返回None
         """
-        if not msg_unique_key:
-            msg_unique_key = self._generate_message_unique_key(
-                room_id, 'member', user_id, ''
+        with self._lock:
+            if not msg_unique_key:
+                msg_unique_key = self._generate_message_unique_key(
+                    room_id, 'member', user_id, ''
+                )
+
+            self._insert_message_record(
+                room_id, 'member', msg_unique_key, user_id, user_name
             )
 
-        if self._message_exists(msg_unique_key):
-            return None
-
-        self._insert_message_record(
-            room_id, 'member', msg_unique_key, user_id, user_name
-        )
-
-        cursor = self.conn.execute(
-            '''INSERT OR IGNORE INTO member_messages
-               (room_id, user_id, user_name, gender, msg_unique_key, create_time)
-               VALUES (?, ?, ?, ?, ?, ?)''',
-            (room_id, user_id or '', user_name or '', gender,
-             msg_unique_key, datetime.now().isoformat())
-        )
-        self.conn.commit()
-        return cursor.lastrowid if cursor.lastrowid else None
+            cursor = self.conn.execute(
+                '''INSERT OR IGNORE INTO member_messages
+                   (room_id, user_id, user_name, gender, msg_unique_key, create_time)
+                   VALUES (?, ?, ?, ?, ?, ?)''',
+                (room_id, user_id or '', user_name or '', gender,
+                 msg_unique_key, datetime.now().isoformat())
+            )
+            self.conn.commit()
+            if cursor.rowcount == 0:
+                return None
+            return cursor.lastrowid
 
     def get_member_messages_by_room(
         self,
@@ -491,6 +527,7 @@ class Database:
 
     # ==================== 关注消息操作 ====================
 
+    @retry_on_lock(max_retries=3, delay=0.1)
     def insert_social_message(
         self,
         room_id: int,
@@ -508,28 +545,28 @@ class Database:
         :param msg_unique_key: 消息唯一键
         :return: 插入的记录ID，如果重复则返回None
         """
-        content = str(action)
-        if not msg_unique_key:
-            msg_unique_key = self._generate_message_unique_key(
-                room_id, 'social', user_id, content
+        with self._lock:
+            content = str(action)
+            if not msg_unique_key:
+                msg_unique_key = self._generate_message_unique_key(
+                    room_id, 'social', user_id, content
+                )
+
+            self._insert_message_record(
+                room_id, 'social', msg_unique_key, user_id, user_name
             )
 
-        if self._message_exists(msg_unique_key):
-            return None
-
-        self._insert_message_record(
-            room_id, 'social', msg_unique_key, user_id, user_name
-        )
-
-        cursor = self.conn.execute(
-            '''INSERT OR IGNORE INTO social_messages
-               (room_id, user_id, user_name, action, msg_unique_key, create_time)
-               VALUES (?, ?, ?, ?, ?, ?)''',
-            (room_id, user_id or '', user_name or '', action,
-             msg_unique_key, datetime.now().isoformat())
-        )
-        self.conn.commit()
-        return cursor.lastrowid if cursor.lastrowid else None
+            cursor = self.conn.execute(
+                '''INSERT OR IGNORE INTO social_messages
+                   (room_id, user_id, user_name, action, msg_unique_key, create_time)
+                   VALUES (?, ?, ?, ?, ?, ?)''',
+                (room_id, user_id or '', user_name or '', action,
+                 msg_unique_key, datetime.now().isoformat())
+            )
+            self.conn.commit()
+            if cursor.rowcount == 0:
+                return None
+            return cursor.lastrowid
 
     def get_social_messages_by_room(
         self,
