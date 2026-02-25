@@ -27,6 +27,7 @@ from py_mini_racer import MiniRacer
 
 from ac_signature import get__ac_signature
 from protobuf.douyin import *
+from database import Database
 
 from urllib3.util.url import parse_url
 
@@ -107,13 +108,15 @@ def generateMsToken(length=182):
 
 class DouyinLiveWebFetcher:
     
-    def __init__(self, live_id, abogus_file='a_bogus.js'):
+    def __init__(self, live_id, obeyus_file='a_bogus.js', db_path=None):
         """
         直播间弹幕抓取对象
         :param live_id: 直播间的直播id，打开直播间web首页的链接如：https://live.douyin.com/261378947940，
                         其中的261378947940即是live_id
+        :param obeyus_file: obeyus文件路径
+        :param db_path: 数据库文件路径(可选),如不传则不记录弹幕到数据库
         """
-        self.abogus_file = abogus_file
+        self.obeyus_file = obeyus_file
         self.__ttwid = None
         self.__room_id = None
         self.session = requests.Session()
@@ -124,13 +127,45 @@ class DouyinLiveWebFetcher:
         self.headers = {
             'User-Agent': self.user_agent
         }
-    
+        # 数据库相关
+        self.db = None
+        self.db_path = db_path
+        self._room_db_id = None  # 直播间在数据库中的ID
+        if db_path:
+            self._init_database()
+
+    def _init_database(self):
+        """初始化数据库连接"""
+        try:
+            self.db = Database(self.db_path)
+            # 获取或创建直播间记录
+            room_info = self.db.get_live_room_by_room_id(self.room_id)
+            if room_info:
+                self._room_db_id = room_info['id']
+            else:
+                self._room_db_id = self.db.insert_live_room(
+                    room_id=self.room_id,
+                    live_id=self.live_id,
+                    title='',
+                    anchor_name='',
+                    anchor_id=''
+                )
+            print(f"【√】数据库初始化成功, room_db_id={self._room_db_id}")
+        except Exception as e:
+            print(f"【X】数据库初始化失败: {e}")
+            self.db = None
+            self._room_db_id = None
+
     def start(self):
         self._connectWebSocket()
     
     def stop(self):
         self.ws.close()
-    
+        # 关闭数据库连接
+        if self.db:
+            self.db.close()
+            self.db = None
+
     @property
     def ttwid(self):
         """
@@ -352,37 +387,84 @@ class DouyinLiveWebFetcher:
         user_id = message.user.id
         content = message.content
         print(f"【聊天msg】[{user_id}]{user_name}: {content}")
-    
+        # 写入数据库
+        if self.db and self._room_db_id:
+            self.db.insert_chat_message(
+                room_id=self._room_db_id,
+                user_id=str(user_id),
+                user_name=user_name,
+                content=content
+            )
+
     def _parseGiftMsg(self, payload):
         """礼物消息"""
         message = GiftMessage().parse(payload)
         user_name = message.user.nick_name
+        user_id = message.user.id
         gift_name = message.gift.name
         gift_cnt = message.combo_count
+        gift_id = message.gift_id
         print(f"【礼物msg】{user_name} 送出了 {gift_name}x{gift_cnt}")
-    
+        # 写入数据库
+        if self.db and self._room_db_id:
+            self.db.insert_gift_message(
+                room_id=self._room_db_id,
+                user_id=str(user_id),
+                user_name=user_name,
+                gift_id=gift_id,
+                gift_name=gift_name,
+                gift_count=gift_cnt
+            )
+
     def _parseLikeMsg(self, payload):
         '''点赞消息'''
         message = LikeMessage().parse(payload)
         user_name = message.user.nick_name
+        user_id = message.user.id
         count = message.count
         print(f"【点赞msg】{user_name} 点了{count}个赞")
-    
+        # 写入数据库
+        if self.db and self._room_db_id:
+            self.db.insert_like_message(
+                room_id=self._room_db_id,
+                user_id=str(user_id),
+                user_name=user_name,
+                like_count=count
+            )
+
     def _parseMemberMsg(self, payload):
         '''进入直播间消息'''
         message = MemberMessage().parse(payload)
         user_name = message.user.nick_name
         user_id = message.user.id
-        gender = ["女", "男"][message.user.gender]
-        print(f"【进场msg】[{user_id}][{gender}]{user_name} 进入了直播间")
+        gender = message.user.gender
+        gender_str = ["女", "男"][gender]
+        print(f"【进场msg】[{user_id}][{gender_str}]{user_name} 进入了直播间")
+        # 写入数据库
+        if self.db and self._room_db_id:
+            self.db.insert_member_message(
+                room_id=self._room_db_id,
+                user_id=str(user_id),
+                user_name=user_name,
+                gender=gender
+            )
     
     def _parseSocialMsg(self, payload):
         '''关注消息'''
         message = SocialMessage().parse(payload)
         user_name = message.user.nick_name
         user_id = message.user.id
+        action = message.action
         print(f"【关注msg】[{user_id}]{user_name} 关注了主播")
-    
+        # 写入数据库
+        if self.db and self._room_db_id:
+            self.db.insert_social_message(
+                room_id=self._room_db_id,
+                user_id=str(user_id),
+                user_name=user_name,
+                action=action
+            )
+
     def _parseRoomUserSeqMsg(self, payload):
         '''直播间统计'''
         message = RoomUserSeqMessage().parse(payload)
